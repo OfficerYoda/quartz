@@ -7,12 +7,13 @@ import {
   stripSlashes,
   simplifySlug,
   splitAnchor,
-  transformLink,
+  transformLink
 } from "../../util/path"
 import path from "path"
 import { visit } from "unist-util-visit"
 import isAbsoluteUrl from "is-absolute-url"
 import { Root } from "hast"
+import { wikilinkRegex } from "./ofm"
 
 interface Options {
   /** How to resolve Markdown paths */
@@ -22,6 +23,7 @@ interface Options {
   openLinksInNewTab: boolean
   lazyLoad: boolean
   externalLinkIcon: boolean
+  indexFrontmatterWikilinks: boolean
 }
 
 const defaultOptions: Options = {
@@ -30,9 +32,28 @@ const defaultOptions: Options = {
   openLinksInNewTab: false,
   lazyLoad: false,
   externalLinkIcon: true,
+  indexFrontmatterWikilinks: true
 }
 
-export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) => {
+function getFullInternalLink(
+  dest: RelativeURL,
+  fileSlug: SimpleSlug
+): FullSlug {
+  // url.resolve is considered legacy
+  // WHATWG equivalent https://nodejs.dev/en/api/v18/url/#urlresolvefrom-to
+  const url = new URL(dest, "https://base.com/" + stripSlashes(fileSlug, true))
+  const canonicalDest = url.pathname
+  let [destCanonical, _destAnchor] = splitAnchor(canonicalDest)
+  if (destCanonical.endsWith("/")) {
+    destCanonical += "index"
+  }
+  // need to decodeURIComponent here as WHATWG URL percent-encodes everything
+  return decodeURIComponent(stripSlashes(destCanonical, true)) as FullSlug
+}
+
+export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (
+  userOpts
+) => {
   const opts = { ...defaultOptions, ...userOpts }
   return {
     name: "LinkProcessing",
@@ -45,7 +66,7 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) 
 
             const transformOptions: TransformOptions = {
               strategy: opts.markdownLinkResolution,
-              allSlugs: ctx.allSlugs,
+              allSlugs: ctx.allSlugs
             }
 
             visit(tree, "element", (node, _index, _parent) => {
@@ -57,7 +78,7 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) 
               ) {
                 let dest = node.properties.href as RelativeURL
                 const classes = (node.properties.className ?? []) as string[]
-                const isExternal = isAbsoluteUrl(dest, { httpOnly: false })
+                const isExternal = isAbsoluteUrl(dest)
                 classes.push(isExternal ? "external" : "internal")
 
                 if (isExternal && opts.externalLinkIcon) {
@@ -68,18 +89,18 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) 
                       "aria-hidden": "true",
                       class: "external-icon",
                       style: "max-width:0.8em;max-height:0.8em",
-                      viewBox: "0 0 512 512",
+                      viewBox: "0 0 512 512"
                     },
                     children: [
                       {
                         type: "element",
                         tagName: "path",
                         properties: {
-                          d: "M320 0H288V64h32 82.7L201.4 265.4 178.7 288 224 333.3l22.6-22.6L448 109.3V192v32h64V192 32 0H480 320zM32 32H0V64 480v32H32 456h32V480 352 320H424v32 96H64V96h96 32V32H160 32z",
+                          d: "M320 0H288V64h32 82.7L201.4 265.4 178.7 288 224 333.3l22.6-22.6L448 109.3V192v32h64V192 32 0H480 320zM32 32H0V64 480v32H32 456h32V480 352 320H424v32 96H64V96h96 32V32H160 32z"
                         },
-                        children: [],
-                      },
-                    ],
+                        children: []
+                      }
+                    ]
                   })
                 }
 
@@ -100,26 +121,16 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) 
 
                 // don't process external links or intra-document anchors
                 const isInternal = !(
-                  isAbsoluteUrl(dest, { httpOnly: false }) || dest.startsWith("#")
+                  isAbsoluteUrl(dest) || dest.startsWith("#")
                 )
                 if (isInternal) {
                   dest = node.properties.href = transformLink(
                     file.data.slug!,
                     dest,
-                    transformOptions,
+                    transformOptions
                   )
 
-                  // url.resolve is considered legacy
-                  // WHATWG equivalent https://nodejs.dev/en/api/v18/url/#urlresolvefrom-to
-                  const url = new URL(dest, "https://base.com/" + stripSlashes(curSlug, true))
-                  const canonicalDest = url.pathname
-                  let [destCanonical, _destAnchor] = splitAnchor(canonicalDest)
-                  if (destCanonical.endsWith("/")) {
-                    destCanonical += "index"
-                  }
-
-                  // need to decodeURIComponent here as WHATWG URL percent-encodes everything
-                  const full = decodeURIComponent(stripSlashes(destCanonical, true)) as FullSlug
+                  const full = getFullInternalLink(dest, curSlug)
                   const simple = simplifySlug(full)
                   outgoing.add(simple)
                   node.properties["data-slug"] = full
@@ -147,23 +158,56 @@ export const CrawlLinks: QuartzTransformerPlugin<Partial<Options>> = (userOpts) 
                   node.properties.loading = "lazy"
                 }
 
-                if (!isAbsoluteUrl(node.properties.src, { httpOnly: false })) {
+                if (!isAbsoluteUrl(node.properties.src)) {
                   let dest = node.properties.src as RelativeURL
                   dest = node.properties.src = transformLink(
                     file.data.slug!,
                     dest,
-                    transformOptions,
+                    transformOptions
                   )
                   node.properties.src = dest
                 }
               }
             })
 
+            if (opts.indexFrontmatterWikilinks) {
+              const strings = Object.values(file.data.frontmatter ?? {})
+                .flatMap((vs) => (Array.isArray(vs) ? vs : [vs]))
+                .filter((v) => typeof v === "string")
+
+              for (const string of strings) {
+                // the regex is /g so we have to do this to get the captures
+                // exec doesn't work because it's stateful and so returns null every other time (very bad)
+                // we do all of that to reuse the wikilinkRegex from ofm
+                const [captures] = [...string.matchAll(wikilinkRegex)]
+                if (
+                  !captures ||
+                  captures[0] != string ||
+                  string.startsWith("!")
+                ) {
+                  // not matched, or didn't match the whole string, or is the embed syntax for some reason,
+                  // which doesn't make sense to support in frontmatter
+                  continue
+                }
+                const [_, rawFp, rawHeader] = captures
+                const fp = rawFp?.trim() ?? ""
+                const anchor = rawHeader?.trim() ?? ""
+                const dest = transformLink(
+                  file.data.slug!,
+                  fp + anchor,
+                  transformOptions
+                )
+                const full = getFullInternalLink(dest, curSlug)
+                const simple = simplifySlug(full)
+                outgoing.add(simple)
+              }
+            }
+
             file.data.links = [...outgoing]
           }
-        },
+        }
       ]
-    },
+    }
   }
 }
 
